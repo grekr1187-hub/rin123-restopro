@@ -93,10 +93,8 @@ app.post("/api/menu", (req, res) => {
 app.post("/api/ai/insight", async (_req, res) => {
   const s = summary();
   const best = [...data.menu].sort((a,b) => b.sales - a.sales)[0];
-  const weakest = [...data.menu].sort((a,b) => (b.price-b.cost) - (a.price-a.cost))[0];
+  const highestMargin = [...data.menu].sort((a,b) => ((b.price-b.cost)/b.price) - ((a.price-a.cost)/a.price))[0];
 
-  // Без OPENAI_API_KEY приложение работает автономно.
-  // При наличии ключа здесь можно подключить OpenAI API отдельно.
   res.json({
     title: "Анализ RestoPro",
     points: [
@@ -105,7 +103,7 @@ app.post("/api/ai/insight", async (_req, res) => {
       `Маржинальность: ${s.margin.toFixed(1)}%.`,
       `Food cost: ${s.foodCostPct.toFixed(1)}%.`,
       `Лидер продаж: ${best?.name || "—"} (${best?.sales || 0} шт.).`,
-      `Товар с высокой маржой: ${weakest?.name || "—"}.`
+      `Высокая маржа: ${highestMargin?.name || "—"}.`
     ],
     actions: [
       "Проверить позиции с низкой маржой и пересмотреть цену/себестоимость.",
@@ -115,7 +113,12 @@ app.post("/api/ai/insight", async (_req, res) => {
   });
 });
 
-app.get("*", (_req, res) => {
+// Express 5: не используем app.get("*"), чтобы сервер не падал при старте.
+// Этот fallback отдаёт интерфейс для всех обычных browser-маршрутов.
+app.use((req, res, next) => {
+  if (req.method !== "GET" || req.path.startsWith("/api/") || req.path === "/health") {
+    return next();
+  }
   res.sendFile(path.join(__dirname, "public", "index.html"));
 });
 
