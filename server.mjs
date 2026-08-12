@@ -1,109 +1,97 @@
 import express from "express";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import pg from "pg";
+import XLSX from "xlsx";
 
+const { Pool } = pg;
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const app = express();
 const PORT = Number(process.env.PORT || 3000);
+const pool = process.env.DATABASE_URL ? new Pool({ connectionString: process.env.DATABASE_URL, max: 10, idleTimeoutMillis: 30000 }) : null;
 
-app.use(express.json({ limit: "8mb" }));
+app.use(express.json({ limit: "10mb" }));
 app.use(express.static(path.join(__dirname, "public")));
 
-const supported = { languages: ["ru", "uz", "en"], currencies: ["UZS", "USD", "RUB"] };
-let data = {
-  restaurant: { name: "RestoPro Demo", currency: "UZS", language: "ru" },
-  daily: [
-    { day: "Пн", revenue: 12800000, expenses: 6900000 }, { day: "Вт", revenue: 14100000, expenses: 7300000 },
-    { day: "Ср", revenue: 11900000, expenses: 6700000 }, { day: "Чт", revenue: 15300000, expenses: 7600000 },
-    { day: "Пт", revenue: 18100000, expenses: 8400000 }, { day: "Сб", revenue: 21400000, expenses: 9600000 },
-    { day: "Вс", revenue: 19700000, expenses: 9100000 }
-  ],
-  orders: [],
-  menu: [
-    { id: 1, name: "Лазанья", category: "Основные", price: 78000, cost: 31000, sales: 86, imageUrl: "" },
-    { id: 2, name: "Стейк", category: "Основные", price: 149000, cost: 67000, sales: 54, imageUrl: "" },
-    { id: 3, name: "Цезарь", category: "Салаты", price: 62000, cost: 25000, sales: 112, imageUrl: "" },
-    { id: 4, name: "Лимонад", category: "Напитки", price: 28000, cost: 7000, sales: 231, imageUrl: "" },
-    { id: 5, name: "Тирамису", category: "Десерты", price: 49000, cost: 18000, sales: 74, imageUrl: "" }
-  ]
-};
+const schema = `
+CREATE TABLE IF NOT EXISTS restaurants (id BIGSERIAL PRIMARY KEY,name TEXT NOT NULL,language TEXT NOT NULL DEFAULT 'ru' CHECK(language IN ('ru','uz','en')),currency TEXT NOT NULL DEFAULT 'UZS' CHECK(currency IN ('UZS','USD','RUB')),created_at TIMESTAMPTZ NOT NULL DEFAULT now());
+CREATE TABLE IF NOT EXISTS staff (id BIGSERIAL PRIMARY KEY,restaurant_id BIGINT NOT NULL REFERENCES restaurants(id) ON DELETE CASCADE,name TEXT NOT NULL,role TEXT NOT NULL,phone TEXT,base_salary NUMERIC(12,2) NOT NULL DEFAULT 0,commission_pct NUMERIC(5,2) NOT NULL DEFAULT 0,rating NUMERIC(3,2) NOT NULL DEFAULT 5,active BOOLEAN NOT NULL DEFAULT true,created_at TIMESTAMPTZ NOT NULL DEFAULT now());
+CREATE TABLE IF NOT EXISTS categories (id BIGSERIAL PRIMARY KEY,restaurant_id BIGINT NOT NULL REFERENCES restaurants(id) ON DELETE CASCADE,name TEXT NOT NULL,type TEXT NOT NULL DEFAULT 'kitchen' CHECK(type IN ('kitchen','bar')));
+CREATE TABLE IF NOT EXISTS dishes (id BIGSERIAL PRIMARY KEY,restaurant_id BIGINT NOT NULL REFERENCES restaurants(id) ON DELETE CASCADE,category_id BIGINT REFERENCES categories(id) ON DELETE SET NULL,name TEXT NOT NULL,description TEXT,price NUMERIC(12,2) NOT NULL DEFAULT 0,cost NUMERIC(12,2) NOT NULL DEFAULT 0,image_url TEXT,active BOOLEAN NOT NULL DEFAULT true,created_at TIMESTAMPTZ NOT NULL DEFAULT now());
+CREATE TABLE IF NOT EXISTS ingredients (id BIGSERIAL PRIMARY KEY,restaurant_id BIGINT NOT NULL REFERENCES restaurants(id) ON DELETE CASCADE,name TEXT NOT NULL,unit TEXT NOT NULL,stock NUMERIC(14,3) NOT NULL DEFAULT 0,cost_per_unit NUMERIC(12,4) NOT NULL DEFAULT 0,min_stock NUMERIC(14,3) NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS recipes (id BIGSERIAL PRIMARY KEY,dish_id BIGINT NOT NULL REFERENCES dishes(id) ON DELETE CASCADE,ingredient_id BIGINT NOT NULL REFERENCES ingredients(id) ON DELETE CASCADE,quantity NUMERIC(14,4) NOT NULL,UNIQUE(dish_id,ingredient_id));
+CREATE TABLE IF NOT EXISTS restaurant_tables (id BIGSERIAL PRIMARY KEY,restaurant_id BIGINT NOT NULL REFERENCES restaurants(id) ON DELETE CASCADE,name TEXT NOT NULL,zone TEXT NOT NULL DEFAULT 'main',capacity INT NOT NULL DEFAULT 4,status TEXT NOT NULL DEFAULT 'free');
+CREATE TABLE IF NOT EXISTS orders (id BIGSERIAL PRIMARY KEY,restaurant_id BIGINT NOT NULL REFERENCES restaurants(id) ON DELETE CASCADE,table_id BIGINT REFERENCES restaurant_tables(id) ON DELETE SET NULL,waiter_id BIGINT REFERENCES staff(id) ON DELETE SET NULL,status TEXT NOT NULL DEFAULT 'open',payment_method TEXT,total NUMERIC(12,2) NOT NULL DEFAULT 0,created_at TIMESTAMPTZ NOT NULL DEFAULT now(),closed_at TIMESTAMPTZ);
+CREATE TABLE IF NOT EXISTS order_items (id BIGSERIAL PRIMARY KEY,order_id BIGINT NOT NULL REFERENCES orders(id) ON DELETE CASCADE,dish_id BIGINT NOT NULL REFERENCES dishes(id),quantity NUMERIC(10,2) NOT NULL,price NUMERIC(12,2) NOT NULL,split_group TEXT);
+CREATE TABLE IF NOT EXISTS purchases (id BIGSERIAL PRIMARY KEY,restaurant_id BIGINT NOT NULL REFERENCES restaurants(id) ON DELETE CASCADE,supplier TEXT,total NUMERIC(12,2) NOT NULL DEFAULT 0,created_at TIMESTAMPTZ NOT NULL DEFAULT now());
+CREATE TABLE IF NOT EXISTS purchase_items (id BIGSERIAL PRIMARY KEY,purchase_id BIGINT NOT NULL REFERENCES purchases(id) ON DELETE CASCADE,ingredient_id BIGINT NOT NULL REFERENCES ingredients(id),quantity NUMERIC(14,3) NOT NULL,unit_cost NUMERIC(12,4) NOT NULL);
+CREATE TABLE IF NOT EXISTS stock_movements (id BIGSERIAL PRIMARY KEY,restaurant_id BIGINT NOT NULL REFERENCES restaurants(id) ON DELETE CASCADE,ingredient_id BIGINT NOT NULL REFERENCES ingredients(id),type TEXT NOT NULL,quantity NUMERIC(14,3) NOT NULL,reason TEXT,created_at TIMESTAMPTZ NOT NULL DEFAULT now());
+CREATE INDEX IF NOT EXISTS idx_orders_restaurant_created ON orders(restaurant_id,created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_dishes_restaurant ON dishes(restaurant_id);
+CREATE INDEX IF NOT EXISTS idx_stock_ingredient ON stock_movements(ingredient_id,created_at DESC);
+`;
 
-function summary() {
-  const revenue = data.daily.reduce((s, x) => s + x.revenue, 0);
-  const expenses = data.daily.reduce((s, x) => s + x.expenses, 0);
-  const profit = revenue - expenses;
-  const avgCheck = data.orders.length ? data.orders.reduce((s, x) => s + x.amount, 0) / data.orders.length : 0;
-  const foodCost = data.menu.reduce((s, x) => s + x.cost * x.sales, 0);
-  const menuRevenue = data.menu.reduce((s, x) => s + x.price * x.sales, 0);
-  return { revenue, expenses, profit, avgCheck, margin: revenue ? profit / revenue * 100 : 0, foodCostPct: menuRevenue ? foodCost / menuRevenue * 100 : 0 };
+const q = (text, params = []) => pool.query(text, params);
+const num = (v, fallback = 0) => Number.isFinite(Number(v)) ? Number(v) : fallback;
+const clean = (v, fallback = "") => String(v ?? fallback).trim();
+
+async function initDb() {
+  if (!pool) return;
+  await q(schema);
+  const r = await q("SELECT id FROM restaurants ORDER BY id LIMIT 1");
+  let restaurantId = r.rows[0]?.id;
+  if (!restaurantId) {
+    restaurantId = (await q("INSERT INTO restaurants(name,language,currency) VALUES($1,$2,$3) RETURNING id", ["RestoPro", "ru", "UZS"])).rows[0].id;
+    const cats = [["Основные блюда","kitchen"],["Салаты","kitchen"],["Десерты","kitchen"],["Бар","bar"],["Напитки","bar"]];
+    const catMap = {};
+    for (const [name,type] of cats) catMap[name] = (await q("INSERT INTO categories(restaurant_id,name,type) VALUES($1,$2,$3) RETURNING id",[restaurantId,name,type])).rows[0].id;
+    const dishes = [["Лазанья","Основные блюда",78000,31000,"🍝"],["Стейк Рибай","Основные блюда",149000,67000,"🥩"],["Цезарь","Салаты",62000,25000,"🥗"],["Лимонад","Напитки",28000,7000,"🍋"],["Тирамису","Десерты",49000,18000,"🍰"],["Капучино","Бар",28000,8000,"☕"]];
+    for (const [name,cat,price,cost,emoji] of dishes) await q("INSERT INTO dishes(restaurant_id,category_id,name,description,price,cost,image_url) VALUES($1,$2,$3,$4,$5,$6,$7)",[restaurantId,catMap[cat],name,"Фирменная позиция RestoPro",price,cost,`emoji:${emoji}`]);
+    for (let i=1;i<=12;i++) await q("INSERT INTO restaurant_tables(restaurant_id,name,zone,capacity,status) VALUES($1,$2,$3,$4,'free')",[restaurantId,`Стол ${String(i).padStart(2,"0")}`,i<=8?"Основной":"Терраса",i%3===0?6:4]);
+    const staff = [["Алина","Официант",8,4.9],["Данияр","Официант",6,4.8],["Мария","Официант",5,4.7],["Алексей","Шеф-повар",0,4.9]];
+    for (const [name,role,pct,rating] of staff) await q("INSERT INTO staff(restaurant_id,name,role,commission_pct,rating) VALUES($1,$2,$3,$4,$5)",[restaurantId,name,role,pct,rating]);
+    const ingredients = [["Мука","кг",42,12000,5],["Лосось","кг",12,95000,3],["Сливки","л",18,28000,4],["Кофе","кг",8,160000,2],["Сахар","кг",35,14000,5],["Говядина","кг",15,110000,3]];
+    for (const x of ingredients) await q("INSERT INTO ingredients(restaurant_id,name,unit,stock,cost_per_unit,min_stock) VALUES($1,$2,$3,$4,$5,$6)",[restaurantId,...x]);
+  }
+  await q("ALTER TABLE staff ADD COLUMN IF NOT EXISTS rating NUMERIC(3,2) NOT NULL DEFAULT 5");
+  return restaurantId;
 }
+async function rid() { const r = await q("SELECT id FROM restaurants ORDER BY id LIMIT 1"); return r.rows[0]?.id; }
+async function dbReady() { if (!pool) throw Object.assign(new Error("DATABASE_URL is not configured"), { status: 503 }); }
+function sendError(res, e) { console.error(e); res.status(e.status || 500).json({ error: e.message || "Internal server error" }); }
 
-app.get("/health", (_req, res) => res.json({ ok: true, service: "restopro-app", time: new Date().toISOString() }));
-app.get("/api/config", (_req, res) => res.json(supported));
-app.get("/api/dashboard", (_req, res) => res.json({ ...summary(), daily: data.daily, orders: data.orders, menu: data.menu, restaurant: data.restaurant }));
-
-app.post("/api/settings", (req, res) => {
-  if (req.body.currency && !supported.currencies.includes(req.body.currency)) return res.status(400).json({ error: "Unsupported currency" });
-  if (req.body.language && !supported.languages.includes(req.body.language)) return res.status(400).json({ error: "Unsupported language" });
-  data.restaurant = { ...data.restaurant, ...(req.body.name ? { name: String(req.body.name).trim() } : {}), ...(req.body.currency ? { currency: req.body.currency } : {}), ...(req.body.language ? { language: req.body.language } : {}) };
-  res.json(data.restaurant);
-});
-
-app.post("/api/orders", (req, res) => {
-  const amount = Number(req.body.amount);
-  if (!Number.isFinite(amount) || amount <= 0) return res.status(400).json({ error: "Сумма заказа должна быть больше 0" });
-  const order = { id: Math.max(0, ...data.orders.map(o => o.id || 0)) + 1, time: new Date().toISOString(), table: String(req.body.table || "-"), amount, status: String(req.body.status || "Новый"), items: Array.isArray(req.body.items) ? req.body.items : [] };
-  data.orders.unshift(order);
-  res.status(201).json(order);
-});
-
-app.post("/api/menu", (req, res) => {
-  const item = { id: Date.now(), name: String(req.body.name || "").trim(), category: String(req.body.category || "Другое").trim(), price: Number(req.body.price), cost: Number(req.body.cost || 0), sales: Number(req.body.sales || 0), imageUrl: String(req.body.imageUrl || "").trim() };
-  if (!item.name || !Number.isFinite(item.price) || item.price <= 0) return res.status(400).json({ error: "Укажите название и цену" });
-  data.menu.push(item); res.status(201).json(item);
-});
-
-app.patch("/api/menu/:id", (req, res) => {
-  const item = data.menu.find(x => x.id === Number(req.params.id));
-  if (!item) return res.status(404).json({ error: "Блюдо не найдено" });
-  if (req.body.name !== undefined) item.name = String(req.body.name).trim();
-  if (req.body.category !== undefined) item.category = String(req.body.category).trim();
-  if (req.body.price !== undefined) item.price = Number(req.body.price);
-  if (req.body.cost !== undefined) item.cost = Number(req.body.cost);
-  if (req.body.imageUrl !== undefined) item.imageUrl = String(req.body.imageUrl).trim();
-  res.json(item);
-});
-
-app.post("/api/ai/chat", async (req, res) => {
-  const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey) return res.status(503).json({ error: "OPENAI_API_KEY не настроен в Railway Variables" });
-  const message = String(req.body.message || "").trim();
-  if (!message) return res.status(400).json({ error: "Введите вопрос" });
-  const context = JSON.stringify({ restaurant: data.restaurant, summary: summary(), orders: data.orders.slice(0, 20), menu: data.menu });
-  try {
-    const r = await fetch("https://api.openai.com/v1/responses", { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` }, body: JSON.stringify({ model: process.env.OPENAI_MODEL || "gpt-5.6", instructions: "Ты AI-помощник RestoPro для владельца и менеджера ресторана. Не принимаешь заказы от гостей. Анализируй данные POS, отвечай кратко и по делу, предлагай действия.", input: `Данные RestoPro: ${context}\n\nВопрос менеджера: ${message}` }) });
-    const json = await r.json();
-    if (!r.ok) return res.status(r.status).json({ error: json.error?.message || "OpenAI request failed" });
-    const text = json.output_text || json.output?.flatMap(x => x.content || []).map(x => x.text || "").join("") || "Нет ответа";
-    res.json({ answer: text });
-  } catch (e) { res.status(502).json({ error: "AI temporarily unavailable", detail: e.message }); }
-});
-
-app.post("/api/telegram/test", async (_req, res) => {
-  const token = process.env.TELEGRAM_BOT_TOKEN; const chatId = process.env.TELEGRAM_CHAT_ID;
-  if (!token || !chatId) return res.status(503).json({ error: "TELEGRAM_BOT_TOKEN и TELEGRAM_CHAT_ID не настроены" });
-  try {
-    const r = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ chat_id: chatId, text: "✅ RestoPro: Telegram интеграция работает." }) });
-    const j = await r.json(); res.status(r.ok ? 200 : 502).json(j);
-  } catch (e) { res.status(502).json({ error: e.message }); }
-});
-
-app.get("/api/export/menu", (_req, res) => {
-  const rows = [["ID","Название","Категория","Цена","Себестоимость","Продажи","Фото"], ...data.menu.map(x => [x.id,x.name,x.category,x.price,x.cost,x.sales,x.imageUrl])];
-  const csv = rows.map(row => row.map(v => `"${String(v ?? "").replaceAll('"','""')}"`).join(",")).join("\n");
-  res.setHeader("Content-Type", "text/csv; charset=utf-8"); res.setHeader("Content-Disposition", "attachment; filename=restopro-menu.csv"); res.send("\ufeff" + csv);
-});
-
-app.use((req, res, next) => { if (req.method !== "GET" || req.path.startsWith("/api/") || req.path === "/health") return next(); res.sendFile(path.join(__dirname, "public", "index.html")); });
-app.listen(PORT, "0.0.0.0", () => console.log(`RestoPro running on port ${PORT}`));
+app.get("/health", async (_req,res) => { try { await dbReady(); await q("SELECT 1"); res.json({ok:true,service:"restopro-app",database:true,time:new Date().toISOString()}); } catch(e) { res.status(503).json({ok:false,service:"restopro-app",database:false,error:e.message}); } });
+app.get("/api/bootstrap", async (_req,res) => { try { const restaurantId=await rid(); const [restaurant,categories,dishes,tables,staff,ingredients,orders]=await Promise.all([
+  q("SELECT id,name,language,currency FROM restaurants WHERE id=$1",[restaurantId]),q("SELECT id,name,type FROM categories WHERE restaurant_id=$1 ORDER BY id",[restaurantId]),q("SELECT d.*,c.name category,c.type category_type FROM dishes d LEFT JOIN categories c ON c.id=d.category_id WHERE d.restaurant_id=$1 AND d.active=true ORDER BY d.id",[restaurantId]),q("SELECT * FROM restaurant_tables WHERE restaurant_id=$1 ORDER BY id",[restaurantId]),q("SELECT id,name,role,base_salary,commission_pct,rating,active FROM staff WHERE restaurant_id=$1 ORDER BY active DESC,id",[restaurantId]),q("SELECT * FROM ingredients WHERE restaurant_id=$1 ORDER BY name",[restaurantId]),q(`SELECT o.*,rt.name table_name,s.name waiter_name,COALESCE(json_agg(json_build_object('id',oi.id,'dishId',oi.dish_id,'name',d.name,'quantity',oi.quantity,'price',oi.price,'splitGroup',oi.split_group,'categoryType',c.type)) FILTER (WHERE oi.id IS NOT NULL),'[]') items FROM orders o LEFT JOIN restaurant_tables rt ON rt.id=o.table_id LEFT JOIN staff s ON s.id=o.waiter_id LEFT JOIN order_items oi ON oi.order_id=o.id LEFT JOIN dishes d ON d.id=oi.dish_id LEFT JOIN categories c ON c.id=d.category_id WHERE o.restaurant_id=$1 GROUP BY o.id,rt.name,s.name ORDER BY o.created_at DESC LIMIT 100`,[restaurantId])]); res.json({restaurant:restaurant.rows[0],categories:categories.rows,dishes:dishes.rows,tables:tables.rows,staff:staff.rows,ingredients:ingredients.rows,orders:orders.rows}); } catch(e){sendError(res,e);} });
+app.get("/api/dashboard", async (_req,res) => { try { const restaurantId=await rid(); const [sales,open,low,top,week]=await Promise.all([
+  q("SELECT COALESCE(SUM(total) FILTER (WHERE created_at::date=CURRENT_DATE),0) revenue,COUNT(*) FILTER (WHERE created_at::date=CURRENT_DATE) orders,COALESCE(AVG(total) FILTER (WHERE created_at::date=CURRENT_DATE),0) avg FROM orders WHERE restaurant_id=$1 AND status='paid'",[restaurantId]),q("SELECT COUNT(*) FROM orders WHERE restaurant_id=$1 AND status IN ('open','preparing','ready')",[restaurantId]),q("SELECT COUNT(*) FROM ingredients WHERE restaurant_id=$1 AND stock<=min_stock",[restaurantId]),q(`SELECT s.name,COUNT(o.id) orders,COALESCE(SUM(o.total),0) sales,s.commission_pct,s.rating FROM staff s LEFT JOIN orders o ON o.waiter_id=s.id AND o.status='paid' AND o.created_at::date=CURRENT_DATE WHERE s.restaurant_id=$1 AND s.role ILIKE '%официант%' GROUP BY s.id ORDER BY sales DESC LIMIT 5`,[restaurantId]),q(`SELECT to_char(d,'Dy') day,COALESCE(SUM(o.total),0) revenue FROM generate_series(CURRENT_DATE-6,CURRENT_DATE,'1 day') d LEFT JOIN orders o ON o.restaurant_id=$1 AND o.status='paid' AND o.created_at::date=d GROUP BY d ORDER BY d`,[restaurantId])]); const s=sales.rows[0]; res.json({revenue:num(s.revenue),orders:num(s.orders),avgCheck:num(s.avg),openOrders:num(open.rows[0].count),lowStock:num(low.rows[0].count),topWaiters:top.rows,week:week.rows}); } catch(e){sendError(res,e);} });
+app.post("/api/settings", async(req,res)=>{try{const id=await rid(),language=clean(req.body.language,"ru"),currency=clean(req.body.currency,"UZS");if(!["ru","uz","en"].includes(language)||!["UZS","USD","RUB"].includes(currency))return res.status(400).json({error:"Unsupported language or currency"});const r=await q("UPDATE restaurants SET name=$1,language=$2,currency=$3 WHERE id=$4 RETURNING id,name,language,currency",[clean(req.body.name,"RestoPro"),language,currency,id]);res.json(r.rows[0])}catch(e){sendError(res,e)}});
+app.get("/api/menu",async(_req,res)=>{try{const r=await q("SELECT d.*,c.name category,c.type category_type FROM dishes d LEFT JOIN categories c ON c.id=d.category_id WHERE d.restaurant_id=$1 AND d.active=true ORDER BY d.id",[await rid()]);res.json(r.rows)}catch(e){sendError(res,e)}});
+app.post("/api/categories",async(req,res)=>{try{const name=clean(req.body.name);if(!name)return res.status(400).json({error:"Название категории обязательно"});const r=await q("INSERT INTO categories(restaurant_id,name,type) VALUES($1,$2,$3) RETURNING *",[await rid(),name,req.body.type==="bar"?"bar":"kitchen"]);res.status(201).json(r.rows[0])}catch(e){sendError(res,e)}});
+app.post("/api/menu",async(req,res)=>{try{const id=await rid(),name=clean(req.body.name);if(!name)return res.status(400).json({error:"Название обязательно"});const r=await q("INSERT INTO dishes(restaurant_id,category_id,name,description,price,cost,image_url) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING *",[id,req.body.categoryId||req.body.category_id||null,name,clean(req.body.description),num(req.body.price),num(req.body.cost),clean(req.body.imageUrl||req.body.image_url)]);res.status(201).json(r.rows[0])}catch(e){sendError(res,e)}});
+app.patch("/api/menu/:id",async(req,res)=>{try{const fields=[],vals=[];for(const k of ["name","description","image_url"]){if(req.body[k]!==undefined){fields.push(`${k}=$${vals.length+1}`);vals.push(clean(req.body[k]));}}for(const k of ["price","cost","category_id"]){if(req.body[k]!==undefined){fields.push(`${k}=$${vals.length+1}`);vals.push(k==="category_id"?req.body[k]:num(req.body[k]));}}if(!fields.length)return res.status(400).json({error:"Нет изменений"});vals.push(req.params.id,await rid());const r=await q(`UPDATE dishes SET ${fields.join(",")} WHERE id=$${vals.length-1} AND restaurant_id=$${vals.length} RETURNING *`,vals);if(!r.rowCount)return res.status(404).json({error:"Блюдо не найдено"});res.json(r.rows[0])}catch(e){sendError(res,e)}});
+app.get("/api/tables",async(_req,res)=>{try{const r=await q("SELECT rt.*,COUNT(o.id) FILTER (WHERE o.status IN ('open','preparing','ready')) open_orders,COALESCE(MAX(o.total) FILTER (WHERE o.status IN ('open','preparing','ready')),0) current_total FROM restaurant_tables rt LEFT JOIN orders o ON o.table_id=rt.id WHERE rt.restaurant_id=$1 GROUP BY rt.id ORDER BY rt.id",[await rid()]);res.json(r.rows)}catch(e){sendError(res,e)}});
+app.post("/api/tables",async(req,res)=>{try{const r=await q("INSERT INTO restaurant_tables(restaurant_id,name,zone,capacity,status) VALUES($1,$2,$3,$4,'free') RETURNING *",[await rid(),clean(req.body.name,"Новый стол"),clean(req.body.zone,"Основной"),num(req.body.capacity,4)]);res.status(201).json(r.rows[0])}catch(e){sendError(res,e)}});
+app.get("/api/staff",async(_req,res)=>{try{const r=await q(`SELECT s.*,COALESCE(SUM(o.total) FILTER(WHERE o.status='paid' AND o.created_at>=CURRENT_DATE),0) today_sales,COUNT(o.id) FILTER(WHERE o.status='paid' AND o.created_at>=CURRENT_DATE) today_orders FROM staff s LEFT JOIN orders o ON o.waiter_id=s.id WHERE s.restaurant_id=$1 GROUP BY s.id ORDER BY s.active DESC,s.id`,[await rid()]);res.json(r.rows)}catch(e){sendError(res,e)}});
+app.post("/api/staff",async(req,res)=>{try{const r=await q("INSERT INTO staff(restaurant_id,name,role,phone,base_salary,commission_pct,rating) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING *",[await rid(),clean(req.body.name,"Новый сотрудник"),clean(req.body.role,"Официант"),clean(req.body.phone),num(req.body.baseSalary),num(req.body.commissionPct),num(req.body.rating,5)]);res.status(201).json(r.rows[0])}catch(e){sendError(res,e)}});
+app.get("/api/orders",async(_req,res)=>{try{const r=await q(`SELECT o.*,rt.name table_name,s.name waiter_name,COALESCE(json_agg(json_build_object('id',oi.id,'dishId',oi.dish_id,'name',d.name,'quantity',oi.quantity,'price',oi.price,'splitGroup',oi.split_group,'categoryType',c.type)) FILTER(WHERE oi.id IS NOT NULL),'[]') items FROM orders o LEFT JOIN restaurant_tables rt ON rt.id=o.table_id LEFT JOIN staff s ON s.id=o.waiter_id LEFT JOIN order_items oi ON oi.order_id=o.id LEFT JOIN dishes d ON d.id=oi.dish_id LEFT JOIN categories c ON c.id=d.category_id WHERE o.restaurant_id=$1 GROUP BY o.id,rt.name,s.name ORDER BY o.created_at DESC LIMIT 200`,[await rid()]);res.json(r.rows)}catch(e){sendError(res,e)}});
+app.post("/api/orders",async(req,res)=>{const client=await pool.connect();try{const restaurantId=await rid(),items=Array.isArray(req.body.items)?req.body.items:[];if(!items.length)return res.status(400).json({error:"Добавьте блюда"});await client.query("BEGIN");const ids=items.map(x=>Number(x.dishId)).filter(Boolean);const dishes=(await client.query("SELECT d.*,c.type category_type FROM dishes d LEFT JOIN categories c ON c.id=d.category_id WHERE d.id=ANY($1::bigint[]) AND d.restaurant_id=$2",[ids,restaurantId])).rows;const map=new Map(dishes.map(d=>[Number(d.id),d]));let total=0;const normalized=items.map(x=>{const d=map.get(Number(x.dishId));const quantity=Math.max(.01,num(x.quantity,1));if(!d)throw new Error("Блюдо не найдено");total+=num(d.price)*quantity;return{d,quantity}});const order=(await client.query("INSERT INTO orders(restaurant_id,table_id,waiter_id,status,total) VALUES($1,$2,$3,'open',$4) RETURNING *",[restaurantId,req.body.tableId||null,req.body.waiterId||null,total])).rows[0];for(const x of normalized)await client.query("INSERT INTO order_items(order_id,dish_id,quantity,price,split_group) VALUES($1,$2,$3,$4,'A')",[order.id,x.d.id,x.quantity,x.d.price]);if(req.body.tableId)await client.query("UPDATE restaurant_tables SET status='busy' WHERE id=$1 AND restaurant_id=$2",[req.body.tableId,restaurantId]);await client.query("COMMIT");res.status(201).json(order)}catch(e){await client.query("ROLLBACK").catch(()=>{});sendError(res,e)}finally{client.release()}});
+app.patch("/api/orders/:id/status",async(req,res)=>{try{const r=await q("UPDATE orders SET status=$1 WHERE id=$2 AND restaurant_id=$3 RETURNING *",[clean(req.body.status,"open"),req.params.id,await rid()]);if(!r.rowCount)return res.status(404).json({error:"Заказ не найден"});res.json(r.rows[0])}catch(e){sendError(res,e)}});
+app.post("/api/orders/:id/split",async(req,res)=>{const client=await pool.connect();try{const groups=Array.isArray(req.body.groups)?req.body.groups:[];await client.query("BEGIN");for(const g of groups)for(const id of g.itemIds||[])await client.query("UPDATE order_items SET split_group=$1 WHERE id=$2 AND order_id=$3",[clean(g.name,"A"),id,req.params.id]);await client.query("COMMIT");res.json({ok:true})}catch(e){await client.query("ROLLBACK").catch(()=>{});sendError(res,e)}finally{client.release()}});
+app.post("/api/orders/:id/pay",async(req,res)=>{const client=await pool.connect();try{await client.query("BEGIN");const order=(await client.query("SELECT * FROM orders WHERE id=$1 AND restaurant_id=$2 FOR UPDATE",[req.params.id,await rid()])).rows[0];if(!order)return res.status(404).json({error:"Заказ не найден"});await client.query("UPDATE orders SET status='paid',payment_method=$1,closed_at=now() WHERE id=$2",[clean(req.body.paymentMethod,"cash"),order.id]);await client.query("UPDATE restaurant_tables SET status='free' WHERE id=$1 AND NOT EXISTS(SELECT 1 FROM orders WHERE table_id=$1 AND status IN('open','preparing','ready'))",[order.table_id]);await client.query("COMMIT");res.json({ok:true,orderId:order.id})}catch(e){await client.query("ROLLBACK").catch(()=>{});sendError(res,e)}finally{client.release()}});
+app.get("/api/kitchen",async(req,res)=>{try{const type=req.query.type==="bar"?"bar":"kitchen";const r=await q(`SELECT o.id,o.status,o.created_at,rt.name table_name,s.name waiter_name,COALESCE(json_agg(json_build_object('name',d.name,'quantity',oi.quantity,'price',oi.price)) FILTER(WHERE oi.id IS NOT NULL),'[]') items FROM orders o LEFT JOIN restaurant_tables rt ON rt.id=o.table_id LEFT JOIN staff s ON s.id=o.waiter_id LEFT JOIN order_items oi ON oi.order_id=o.id LEFT JOIN dishes d ON d.id=oi.dish_id LEFT JOIN categories c ON c.id=d.category_id WHERE o.restaurant_id=$1 AND o.status IN('open','preparing','ready') AND c.type=$2 GROUP BY o.id,rt.name,s.name ORDER BY o.created_at`,[await rid(),type]);res.json(r.rows)}catch(e){sendError(res,e)}});
+app.get("/api/stock",async(_req,res)=>{try{const id=await rid();const[i,p,m]=await Promise.all([q("SELECT * FROM ingredients WHERE restaurant_id=$1 ORDER BY name",[id]),q("SELECT * FROM purchases WHERE restaurant_id=$1 ORDER BY created_at DESC LIMIT 50",[id]),q("SELECT sm.*,i.name ingredient_name FROM stock_movements sm JOIN ingredients i ON i.id=sm.ingredient_id WHERE sm.restaurant_id=$1 ORDER BY sm.created_at DESC LIMIT 100",[id])]);res.json({ingredients:i.rows,purchases:p.rows,movements:m.rows})}catch(e){sendError(res,e)}});
+app.post("/api/ingredients",async(req,res)=>{try{const r=await q("INSERT INTO ingredients(restaurant_id,name,unit,stock,cost_per_unit,min_stock) VALUES($1,$2,$3,$4,$5,$6) RETURNING *",[await rid(),clean(req.body.name),clean(req.body.unit,"шт"),num(req.body.stock),num(req.body.costPerUnit),num(req.body.minStock)]);res.status(201).json(r.rows[0])}catch(e){sendError(res,e)}});
+app.post("/api/purchases",async(req,res)=>{const client=await pool.connect();try{const id=await rid(),items=Array.isArray(req.body.items)?req.body.items:[];if(!items.length)return res.status(400).json({error:"Добавьте позиции закупки"});await client.query("BEGIN");let total=0;const p=(await client.query("INSERT INTO purchases(restaurant_id,supplier,total) VALUES($1,$2,0) RETURNING *",[id,clean(req.body.supplier,"Поставщик")])).rows[0];for(const x of items){const quantity=num(x.quantity),unitCost=num(x.unitCost);total+=quantity*unitCost;await client.query("INSERT INTO purchase_items(purchase_id,ingredient_id,quantity,unit_cost) VALUES($1,$2,$3,$4)",[p.id,x.ingredientId,quantity,unitCost]);await client.query("UPDATE ingredients SET stock=stock+$1,cost_per_unit=$2 WHERE id=$3 AND restaurant_id=$4",[quantity,unitCost,x.ingredientId,id]);await client.query("INSERT INTO stock_movements(restaurant_id,ingredient_id,type,quantity,reason) VALUES($1,$2,'purchase',$3,$4)",[id,x.ingredientId,quantity,clean(req.body.supplier,"Поставка")]);}const out=(await client.query("UPDATE purchases SET total=$1 WHERE id=$2 RETURNING *",[total,p.id])).rows[0];await client.query("COMMIT");res.status(201).json(out)}catch(e){await client.query("ROLLBACK").catch(()=>{});sendError(res,e)}finally{client.release()}});
+app.get("/api/recipes",async(_req,res)=>{try{const r=await q(`SELECT d.id dish_id,d.name dish_name,COALESCE(SUM(r.quantity*i.cost_per_unit),d.cost) cost,COALESCE(json_agg(json_build_object('ingredientId',i.id,'ingredient',i.name,'unit',i.unit,'quantity',r.quantity,'cost',r.quantity*i.cost_per_unit)) FILTER(WHERE r.id IS NOT NULL),'[]') ingredients FROM dishes d LEFT JOIN recipes r ON r.dish_id=d.id LEFT JOIN ingredients i ON i.id=r.ingredient_id WHERE d.restaurant_id=$1 GROUP BY d.id ORDER BY d.id`,[await rid()]);res.json(r.rows)}catch(e){sendError(res,e)}});
+app.post("/api/recipes",async(req,res)=>{const client=await pool.connect();try{await client.query("BEGIN");await client.query("DELETE FROM recipes WHERE dish_id=$1",[req.body.dishId]);for(const x of req.body.ingredients||[])await client.query("INSERT INTO recipes(dish_id,ingredient_id,quantity) VALUES($1,$2,$3)",[req.body.dishId,x.ingredientId,num(x.quantity)]);const cost=(await client.query("SELECT COALESCE(SUM(r.quantity*i.cost_per_unit),0) cost FROM recipes r JOIN ingredients i ON i.id=r.ingredient_id WHERE r.dish_id=$1",[req.body.dishId])).rows[0].cost;await client.query("UPDATE dishes SET cost=$1 WHERE id=$2",[cost,req.body.dishId]);await client.query("COMMIT");res.json({ok:true,cost:num(cost)})}catch(e){await client.query("ROLLBACK").catch(()=>{});sendError(res,e)}finally{client.release()}});
+app.get("/api/reports",async(_req,res)=>{try{const id=await rid();const[sales,methods,top,expenses]=await Promise.all([q("SELECT created_at::date date,COUNT(*) orders,COALESCE(SUM(total),0) revenue,COALESCE(AVG(total),0) avg FROM orders WHERE restaurant_id=$1 AND status='paid' AND created_at>=CURRENT_DATE-INTERVAL '30 days' GROUP BY created_at::date ORDER BY date",[id]),q("SELECT COALESCE(payment_method,'unknown') method,COUNT(*) orders,COALESCE(SUM(total),0) total FROM orders WHERE restaurant_id=$1 AND status='paid' AND created_at>=CURRENT_DATE-INTERVAL '30 days' GROUP BY payment_method",[id]),q("SELECT d.name,SUM(oi.quantity) qty,SUM(oi.quantity*oi.price) revenue FROM order_items oi JOIN orders o ON o.id=oi.order_id JOIN dishes d ON d.id=oi.dish_id WHERE o.restaurant_id=$1 AND o.status='paid' GROUP BY d.id ORDER BY revenue DESC LIMIT 10",[id]),q("SELECT COALESCE(SUM(total),0) purchases FROM purchases WHERE restaurant_id=$1 AND created_at>=CURRENT_DATE-INTERVAL '30 days'",[id])]);res.json({sales:sales.rows,paymentMethods:methods.rows,topDishes:top.rows,purchases:num(expenses.rows[0].purchases)})}catch(e){sendError(res,e)}});
+app.get("/api/export/xlsx",async(_req,res)=>{try{const id=await rid();const[orders,items,menu,stock,staff]=await Promise.all([q("SELECT id,created_at,status,payment_method,total,table_id,waiter_id FROM orders WHERE restaurant_id=$1 ORDER BY created_at DESC",[id]),q("SELECT oi.order_id,d.name,oi.quantity,oi.price,oi.split_group FROM order_items oi JOIN dishes d ON d.id=oi.dish_id JOIN orders o ON o.id=oi.order_id WHERE o.restaurant_id=$1 ORDER BY oi.order_id DESC",[id]),q("SELECT d.id,d.name,c.name category,d.price,d.cost,d.image_url FROM dishes d LEFT JOIN categories c ON c.id=d.category_id WHERE d.restaurant_id=$1 ORDER BY d.id",[id]),q("SELECT id,name,unit,stock,cost_per_unit,min_stock FROM ingredients WHERE restaurant_id=$1 ORDER BY name",[id]),q("SELECT id,name,role,base_salary,commission_pct,rating,active FROM staff WHERE restaurant_id=$1 ORDER BY id",[id])]);const wb=XLSX.utils.book_new();const add=(n,rows)=>XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(rows),n);add("Orders",orders.rows);add("Order Items",items.rows);add("Menu",menu.rows);add("Stock",stock.rows);add("Staff",staff.rows);const buf=XLSX.write(wb,{type:"buffer",bookType:"xlsx"});res.setHeader("Content-Type","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");res.setHeader("Content-Disposition","attachment; filename=restopro-report.xlsx");res.send(buf)}catch(e){sendError(res,e)}});
+app.post("/api/ai/chat",async(req,res)=>{try{const key=process.env.OPENAI_API_KEY;if(!key)return res.status(503).json({error:"Добавьте OPENAI_API_KEY в Railway Variables"});const id=await rid();const[d,o,s]=await Promise.all([q("SELECT name,price,cost FROM dishes WHERE restaurant_id=$1",[id]),q("SELECT status,total,created_at FROM orders WHERE restaurant_id=$1 ORDER BY created_at DESC LIMIT 50",[id]),q("SELECT name,role,commission_pct,rating FROM staff WHERE restaurant_id=$1",[id])]);const input=`Ты управляющий AI для RestoPro. Анализируй POS-данные и отвечай кратко, практично и на языке пользователя. Данные: ${JSON.stringify({dishes:d.rows,orders:o.rows,staff:s.rows})}\nВопрос: ${clean(req.body.message)}`;const r=await fetch("https://api.openai.com/v1/responses",{method:"POST",headers:{"Content-Type":"application/json",Authorization:`Bearer ${key}`},body:JSON.stringify({model:process.env.OPENAI_MODEL||"gpt-5.4",instructions:"Ты AI-помощник ресторана. Не выдумывай цифры.",input})});const j=await r.json();if(!r.ok)return res.status(r.status).json({error:j.error?.message||"OpenAI error"});res.json({answer:j.output_text||"Нет ответа"})}catch(e){sendError(res,e)}});
+app.post("/api/telegram/test",async(_req,res)=>{try{const token=process.env.TELEGRAM_BOT_TOKEN,chatId=process.env.TELEGRAM_CHAT_ID;if(!token||!chatId)return res.status(503).json({error:"TELEGRAM_BOT_TOKEN и TELEGRAM_CHAT_ID пока не заданы"});const r=await fetch(`https://api.telegram.org/bot${token}/sendMessage`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({chat_id:chatId,text:"✅ RestoPro: Telegram интеграция работает."})});const j=await r.json();res.status(r.ok?200:502).json(j)}catch(e){sendError(res,e)}});
+app.use((req,res,next)=>{if(req.method!=="GET"||req.path.startsWith("/api/")||req.path==="/health")return next();res.sendFile(path.join(__dirname,"public","index.html"))});
+await initDb();
+const server=app.listen(PORT,"0.0.0.0",()=>console.log(`RestoPro running on ${PORT}`));
+process.on("SIGTERM",async()=>{server.close(async()=>{await pool?.end();process.exit(0)})});
+process.on("SIGINT",async()=>{server.close(async()=>{await pool?.end();process.exit(0)})});
