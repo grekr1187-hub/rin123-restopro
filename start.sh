@@ -1,2 +1,2 @@
 #!/bin/sh
-exec node server.mjs
+exec node server.final.mjs
