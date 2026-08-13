@@ -1,0 +1,11 @@
+{
+  "name": "RestoPro — Restaurant OS",
+  "short_name": "RestoPro",
+  "description": "Профессиональная POS-система для ресторанов и кафе",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#07101d",
+  "theme_color": "#5b8cff",
+  "lang": "ru",
+  "icons": []
+}
