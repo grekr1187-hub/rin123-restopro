@@ -1,0 +1,18 @@
+name: RestoPro CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+jobs:
+  syntax:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm install --no-audit --no-fund
+      - run: node --check server.mjs
+      - run: node -e "const fs=require('fs');const h=fs.readFileSync('public/index.html','utf8');const s=[...h.matchAll(/<script(?:[^>]*)>([\\s\\S]*?)<\\/script>/gi)].map(x=>x[1]).filter(x=>x.trim());for(let i=0;i<s.length;i++)fs.writeFileSync('/tmp/restopro-'+i+'.mjs',s[i]);"
+      - run: for f in /tmp/restopro-*.mjs; do node --check "$f"; done
