@@ -57,8 +57,6 @@ async function initDb() {
   }
   await q("ALTER TABLE staff ADD COLUMN IF NOT EXISTS rating NUMERIC(3,2) NOT NULL DEFAULT 5");
   await q("ALTER TABLE staff ADD COLUMN IF NOT EXISTS username TEXT");
-  const firstStaff=await q("SELECT id FROM staff WHERE restaurant_id=$1 ORDER BY id LIMIT 1",[restaurantId]);
-  if(firstStaff.rows[0] && !(await q("SELECT username FROM staff WHERE id=$1",[firstStaff.rows[0].id])).rows[0].username){const pw=process.env.RESTOPRO_ADMIN_PASSWORD||"RestoPro123!";await q("UPDATE staff SET username='admin',password_hash=$1 WHERE id=$2",[hashPassword(pw),firstStaff.rows[0].id]);}
   await q("ALTER TABLE staff ADD COLUMN IF NOT EXISTS password_hash TEXT");
   await q("ALTER TABLE restaurant_tables ADD COLUMN IF NOT EXISTS service_pct NUMERIC(5,2) NOT NULL DEFAULT 0");
   await q("CREATE TABLE IF NOT EXISTS dish_ratings (id BIGSERIAL PRIMARY KEY,restaurant_id BIGINT NOT NULL REFERENCES restaurants(id) ON DELETE CASCADE,dish_id BIGINT NOT NULL REFERENCES dishes(id) ON DELETE CASCADE,rating NUMERIC(3,2) NOT NULL,comment TEXT,created_at TIMESTAMPTZ NOT NULL DEFAULT now())");
