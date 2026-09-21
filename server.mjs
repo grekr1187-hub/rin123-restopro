@@ -3,6 +3,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import pg from "pg";
 import XLSX from "xlsx";
+import crypto from "node:crypto";
 
 const { Pool } = pg;
 const __filename = fileURLToPath(import.meta.url);
