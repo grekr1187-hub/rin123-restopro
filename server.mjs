@@ -56,6 +56,13 @@ async function initDb() {
     for (const x of ingredients) await q("INSERT INTO ingredients(restaurant_id,name,unit,stock,cost_per_unit,min_stock) VALUES($1,$2,$3,$4,$5,$6)",[restaurantId,...x]);
   }
   await q("ALTER TABLE staff ADD COLUMN IF NOT EXISTS rating NUMERIC(3,2) NOT NULL DEFAULT 5");
+  await q("ALTER TABLE staff ADD COLUMN IF NOT EXISTS username TEXT");
+  await q("ALTER TABLE staff ADD COLUMN IF NOT EXISTS password_hash TEXT");
+  await q("ALTER TABLE restaurant_tables ADD COLUMN IF NOT EXISTS service_pct NUMERIC(5,2) NOT NULL DEFAULT 0");
+  await q("CREATE TABLE IF NOT EXISTS dish_ratings (id BIGSERIAL PRIMARY KEY,restaurant_id BIGINT NOT NULL REFERENCES restaurants(id) ON DELETE CASCADE,dish_id BIGINT NOT NULL REFERENCES dishes(id) ON DELETE CASCADE,rating NUMERIC(3,2) NOT NULL,comment TEXT,created_at TIMESTAMPTZ NOT NULL DEFAULT now())");
+  await q("CREATE TABLE IF NOT EXISTS auth_sessions (token TEXT PRIMARY KEY,restaurant_id BIGINT NOT NULL,staff_id BIGINT NOT NULL REFERENCES staff(id) ON DELETE CASCADE,expires_at TIMESTAMPTZ NOT NULL,created_at TIMESTAMPTZ NOT NULL DEFAULT now())");
+  const firstStaff=await q("SELECT id FROM staff WHERE restaurant_id=$1 ORDER BY id LIMIT 1",[restaurantId]);
+  if(firstStaff.rows[0] && !firstStaff.rows[0].username){const pw=process.env.RESTOPRO_ADMIN_PASSWORD||"RestoPro123!";const hash=crypto.createHash("sha256").update(pw).digest("hex");await q("UPDATE staff SET username='admin',password_hash=$1 WHERE id=$2",[hash,firstStaff.rows[0].id]);}
   return restaurantId;
 }
 async function rid() { const r = await q("SELECT id FROM restaurants ORDER BY id LIMIT 1"); return r.rows[0]?.id; }
